@@ -1,4 +1,4 @@
-# vault-lp
+# VAULT-LP
 
 **Passive LP Vaults for MemeLiquid Perpetuals**
 
