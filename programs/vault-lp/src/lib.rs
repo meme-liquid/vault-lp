@@ -469,24 +469,14 @@ pub mod vault_lp {
     /// Reset a depleted vault so it can accept new deposits.
     /// Admin-only. Zeroes total_shares when vault value is 0 (LP capital + PnL <= 0).
     /// This allows the vault to restart from scratch after being depleted.
+    /// Admin-only reset: zeroes total_shares so vault can restart.
+    /// Use after force-realize or when vault is in inconsistent state.
     pub fn reset_vault(ctx: Context<ResetVault>) -> Result<()> {
-        let vault = &ctx.accounts.vault_state;
-        let lp_idx = vault.lp_idx;
-
-        // Verify vault is actually depleted
-        let slab_data = ctx.accounts.slab.try_borrow_data()?;
-        let (capital, pnl) = read_lp_capital_pnl(&slab_data, lp_idx)?;
-        drop(slab_data);
-
-        let vault_value: i128 = (capital as i128) + pnl;
-        require!(vault_value <= 0, VaultError::VaultNotDepleted);
-
-        // Reset shares to 0
         let vault = &mut ctx.accounts.vault_state;
         let old_shares = vault.total_shares;
         vault.total_shares = 0;
 
-        msg!("Vault reset: total_shares {} → 0 (vault_value={})", old_shares, vault_value);
+        msg!("Vault reset: total_shares {} → 0", old_shares);
         Ok(())
     }
 }
