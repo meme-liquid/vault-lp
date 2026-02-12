@@ -461,6 +461,30 @@ pub mod vault_lp {
         );
         Ok(())
     }
+
+    /// Reset a depleted vault so it can accept new deposits.
+    /// Admin-only. Zeroes total_shares when vault value is 0 (LP capital + PnL <= 0).
+    /// This allows the vault to restart from scratch after being depleted.
+    pub fn reset_vault(ctx: Context<ResetVault>) -> Result<()> {
+        let vault = &ctx.accounts.vault_state;
+        let lp_idx = vault.lp_idx;
+
+        // Verify vault is actually depleted
+        let slab_data = ctx.accounts.slab.try_borrow_data()?;
+        let (capital, pnl) = read_lp_capital_pnl(&slab_data, lp_idx)?;
+        drop(slab_data);
+
+        let vault_value: i128 = (capital as i128) + pnl;
+        require!(vault_value <= 0, VaultError::VaultNotDepleted);
+
+        // Reset shares to 0
+        let vault = &mut ctx.accounts.vault_state;
+        let old_shares = vault.total_shares;
+        vault.total_shares = 0;
+
+        msg!("Vault reset: total_shares {} → 0 (vault_value={})", old_shares, vault_value);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -676,6 +700,26 @@ pub struct Withdraw<'info> {
     pub clock: Sysvar<'info, Clock>,
 }
 
+#[derive(Accounts)]
+pub struct ResetVault<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault_lp", vault_state.slab.as_ref()],
+        bump = vault_state.bump,
+        constraint = vault_state.admin == admin.key() @ VaultError::AdminMismatch,
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
+
+    /// CHECK: percolator-prog slab (read-only to check LP value)
+    #[account(
+        constraint = slab.key() == vault_state.slab @ VaultError::SlabMismatch
+    )]
+    pub slab: AccountInfo<'info>,
+}
+
 // ============================================================================
 // State
 // ============================================================================
@@ -746,4 +790,6 @@ pub enum VaultError {
     PositionOwnerMismatch,
     #[msg("Admin account mismatch")]
     AdminMismatch,
+    #[msg("Vault is not depleted (capital + pnl > 0), cannot reset")]
+    VaultNotDepleted,
 }
