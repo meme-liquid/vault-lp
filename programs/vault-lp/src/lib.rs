@@ -329,12 +329,7 @@ pub mod vault_lp {
     pub fn withdraw(ctx: Context<Withdraw>, shares_to_burn: u128) -> Result<()> {
         require!(shares_to_burn > 0, VaultError::ZeroAmount);
 
-        // After vault reset: invalidate stale shares
-        let position = &mut ctx.accounts.user_position;
-        let vault_total = ctx.accounts.vault_state.total_shares;
-        if vault_total == 0 || position.shares > vault_total {
-            position.shares = 0;
-        }
+        let position = &ctx.accounts.user_position;
         require!(position.shares >= shares_to_burn, VaultError::InsufficientShares);
 
         let vault = &ctx.accounts.vault_state;
