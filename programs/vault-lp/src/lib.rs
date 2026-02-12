@@ -43,6 +43,9 @@ const INIT_LP_TAG: u8 = 2;
 const DEPOSIT_COLLATERAL_TAG: u8 = 3;
 const WITHDRAW_COLLATERAL_TAG: u8 = 4;
 
+/// 1% fee on deposits and withdrawals (100 basis points)
+const VAULT_FEE_BPS: u64 = 100;
+
 // ============================================================================
 // Program
 // ============================================================================
@@ -180,10 +183,22 @@ pub mod vault_lp {
 
     /// Deposit native SOL into the vault, receive shares.
     /// Anyone can call. SOL is automatically wrapped to wSOL internally.
+    /// A 1% fee is deducted and sent to the vault admin.
     pub fn deposit(ctx: Context<Deposit>, amount_lamports: u64) -> Result<()> {
         require!(amount_lamports > 0, VaultError::ZeroAmount);
 
+        // ---- Calculate fee ----
+        let fee = amount_lamports
+            .checked_mul(VAULT_FEE_BPS)
+            .ok_or(VaultError::MathOverflow)?
+            / 10_000;
+        let net_amount = amount_lamports
+            .checked_sub(fee)
+            .ok_or(VaultError::MathOverflow)?;
+        require!(net_amount > 0, VaultError::DepositTooSmall);
+
         let vault = &ctx.accounts.vault_state;
+        let admin_key = vault.admin;
         let slab_key = vault.slab;
         let lp_idx = vault.lp_idx;
         let bump = vault.bump;
@@ -196,13 +211,12 @@ pub mod vault_lp {
 
         let vault_value: i128 = (capital as i128) + pnl;
 
-        // ---- Calculate shares to issue ----
+        // ---- Calculate shares to issue (based on net amount after fee) ----
         let new_shares: u128 = if total_shares == 0 {
-            // First deposit: 1 lamport = 1 share
-            amount_lamports as u128
+            net_amount as u128
         } else {
             require!(vault_value > 0, VaultError::VaultDepleted);
-            let result = (amount_lamports as u128)
+            let result = (net_amount as u128)
                 .checked_mul(total_shares)
                 .ok_or(VaultError::MathOverflow)?
                 / (vault_value as u128);
@@ -210,12 +224,32 @@ pub mod vault_lp {
             result
         };
 
-        // ---- SOL Wrap: user → vault_wsol_ata ----
+        // ---- Fee: depositor → admin (native SOL) ----
+        if fee > 0 {
+            require!(
+                ctx.accounts.admin.key() == admin_key,
+                VaultError::AdminMismatch
+            );
+            anchor_lang::solana_program::program::invoke(
+                &system_instruction::transfer(
+                    &ctx.accounts.depositor.key(),
+                    &ctx.accounts.admin.key(),
+                    fee,
+                ),
+                &[
+                    ctx.accounts.depositor.to_account_info(),
+                    ctx.accounts.admin.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // ---- SOL Wrap: user → vault_wsol_ata (net amount only) ----
         anchor_lang::solana_program::program::invoke(
             &system_instruction::transfer(
                 &ctx.accounts.depositor.key(),
                 &ctx.accounts.vault_wsol_ata.key(),
-                amount_lamports,
+                net_amount,
             ),
             &[
                 ctx.accounts.depositor.to_account_info(),
@@ -228,11 +262,11 @@ pub mod vault_lp {
             SyncNative { account: ctx.accounts.vault_wsol_ata.to_account_info() },
         ))?;
 
-        // ---- CPI: DepositCollateral ----
+        // ---- CPI: DepositCollateral (net amount) ----
         let mut ix_data = Vec::with_capacity(11);
         ix_data.push(DEPOSIT_COLLATERAL_TAG);
         ix_data.extend_from_slice(&lp_idx.to_le_bytes());
-        ix_data.extend_from_slice(&amount_lamports.to_le_bytes());
+        ix_data.extend_from_slice(&net_amount.to_le_bytes());
 
         let ix = Instruction {
             program_id: PERCOLATOR_PROG_ID,
@@ -279,14 +313,15 @@ pub mod vault_lp {
             .ok_or(VaultError::MathOverflow)?;
 
         msg!(
-            "Deposited {} lamports, {} new shares (total_shares={}, vault_value={})",
-            amount_lamports, new_shares, vault.total_shares, vault_value
+            "Deposited {} lamports (fee={}, net={}), {} new shares (total_shares={}, vault_value={})",
+            amount_lamports, fee, net_amount, new_shares, vault.total_shares, vault_value
         );
         Ok(())
     }
 
     /// Withdraw native SOL by burning shares.
     /// Anyone can call. wSOL is automatically unwrapped to native SOL.
+    /// A 1% fee is deducted and sent to the vault admin.
     pub fn withdraw(ctx: Context<Withdraw>, shares_to_burn: u128) -> Result<()> {
         require!(shares_to_burn > 0, VaultError::ZeroAmount);
 
@@ -294,6 +329,7 @@ pub mod vault_lp {
         require!(position.shares >= shares_to_burn, VaultError::InsufficientShares);
 
         let vault = &ctx.accounts.vault_state;
+        let admin_key = vault.admin;
         let slab_key = vault.slab;
         let lp_idx = vault.lp_idx;
         let bump = vault.bump;
@@ -308,8 +344,8 @@ pub mod vault_lp {
         let vault_value: i128 = (capital as i128) + pnl;
         require!(vault_value > 0, VaultError::VaultDepleted);
 
-        // ---- Calculate withdrawal amount ----
-        let withdraw_lamports: u64 = {
+        // ---- Calculate gross withdrawal, then deduct fee ----
+        let gross_withdraw: u64 = {
             let result = (shares_to_burn as u128)
                 .checked_mul(vault_value as u128)
                 .ok_or(VaultError::MathOverflow)?
@@ -317,6 +353,15 @@ pub mod vault_lp {
             require!(result > 0, VaultError::WithdrawTooSmall);
             result as u64
         };
+
+        let fee = gross_withdraw
+            .checked_mul(VAULT_FEE_BPS)
+            .ok_or(VaultError::MathOverflow)?
+            / 10_000;
+        let withdraw_lamports = gross_withdraw
+            .checked_sub(fee)
+            .ok_or(VaultError::MathOverflow)?;
+        require!(withdraw_lamports > 0, VaultError::WithdrawTooSmall);
 
         // ---- Update shares FIRST (before CPI, reentrancy protection) ----
         let position = &mut ctx.accounts.user_position;
@@ -329,11 +374,11 @@ pub mod vault_lp {
             .checked_sub(shares_to_burn)
             .ok_or(VaultError::MathOverflow)?;
 
-        // ---- CPI: WithdrawCollateral ----
+        // ---- CPI: WithdrawCollateral (gross amount — full amount from percolator) ----
         let mut ix_data = Vec::with_capacity(11);
         ix_data.push(WITHDRAW_COLLATERAL_TAG);
         ix_data.extend_from_slice(&lp_idx.to_le_bytes());
-        ix_data.extend_from_slice(&withdraw_lamports.to_le_bytes());
+        ix_data.extend_from_slice(&gross_withdraw.to_le_bytes());
 
         let ix = Instruction {
             program_id: PERCOLATOR_PROG_ID,
@@ -366,8 +411,27 @@ pub mod vault_lp {
             &[seeds],
         )?;
 
-        // ---- Unwrap: wSOL → native SOL ----
-        // Transfer wSOL from vault_wsol_ata → withdrawer_wsol_ata
+        // ---- Fee: transfer fee portion (wSOL) to admin's wSOL ATA ----
+        if fee > 0 {
+            require!(
+                ctx.accounts.admin_wsol_ata.key() == anchor_spl::associated_token::get_associated_token_address(&admin_key, &WSOL_MINT),
+                VaultError::AdminMismatch
+            );
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault_wsol_ata.to_account_info(),
+                        to: ctx.accounts.admin_wsol_ata.to_account_info(),
+                        authority: ctx.accounts.vault_state.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                fee,
+            )?;
+        }
+
+        // ---- Unwrap: wSOL → native SOL (net amount to user) ----
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -392,8 +456,8 @@ pub mod vault_lp {
         ))?;
 
         msg!(
-            "Withdrew {} shares → {} lamports (total_shares={}, vault_value={})",
-            shares_to_burn, withdraw_lamports, ctx.accounts.vault_state.total_shares, vault_value
+            "Withdrew {} shares → {} lamports (fee={}, net={}, total_shares={}, vault_value={})",
+            shares_to_burn, gross_withdraw, fee, withdraw_lamports, ctx.accounts.vault_state.total_shares, vault_value
         );
         Ok(())
     }
@@ -523,6 +587,13 @@ pub struct Deposit<'info> {
     )]
     pub percolator_program: AccountInfo<'info>,
 
+    /// CHECK: admin account to receive deposit fee (must match vault_state.admin)
+    #[account(
+        mut,
+        constraint = admin.key() == vault_state.admin @ VaultError::AdminMismatch
+    )]
+    pub admin: AccountInfo<'info>,
+
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub clock: Sysvar<'info, Clock>,
@@ -594,6 +665,10 @@ pub struct Withdraw<'info> {
 
     /// CHECK: oracle price account for percolator-prog WithdrawCollateral
     pub oracle: AccountInfo<'info>,
+
+    /// CHECK: admin's wSOL ATA to receive withdrawal fee
+    #[account(mut)]
+    pub admin_wsol_ata: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -669,4 +744,6 @@ pub enum VaultError {
     InsufficientShares,
     #[msg("Position owner mismatch")]
     PositionOwnerMismatch,
+    #[msg("Admin account mismatch")]
+    AdminMismatch,
 }
