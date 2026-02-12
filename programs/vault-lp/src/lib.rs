@@ -329,7 +329,13 @@ pub mod vault_lp {
     pub fn withdraw(ctx: Context<Withdraw>, shares_to_burn: u128) -> Result<()> {
         require!(shares_to_burn > 0, VaultError::ZeroAmount);
 
-        let position = &ctx.accounts.user_position;
+        // Invalidate stale shares from before vault reset
+        let position = &mut ctx.accounts.user_position;
+        let total = ctx.accounts.vault_state.total_shares;
+        if total > 0 && position.shares > total {
+            position.shares = 0;
+            return Err(VaultError::StaleShares.into());
+        }
         require!(position.shares >= shares_to_burn, VaultError::InsufficientShares);
 
         let vault = &ctx.accounts.vault_state;
@@ -477,6 +483,16 @@ pub mod vault_lp {
         vault.total_shares = 0;
 
         msg!("Vault reset: total_shares {} → 0", old_shares);
+        Ok(())
+    }
+
+    /// Admin-only: zero out a user's stale shares after vault reset.
+    pub fn reset_user_position(ctx: Context<ResetUserPosition>) -> Result<()> {
+        let position = &mut ctx.accounts.user_position;
+        let old_shares = position.shares;
+        position.shares = 0;
+
+        msg!("User position reset: shares {} → 0", old_shares);
         Ok(())
     }
 }
@@ -714,6 +730,26 @@ pub struct ResetVault<'info> {
     pub slab: AccountInfo<'info>,
 }
 
+#[derive(Accounts)]
+pub struct ResetUserPosition<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"vault_lp", vault_state.slab.as_ref()],
+        bump = vault_state.bump,
+        constraint = vault_state.admin == admin.key() @ VaultError::AdminMismatch,
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
+
+    /// The user position to reset (any user)
+    #[account(
+        mut,
+        constraint = user_position.vault == vault_state.key() @ VaultError::SlabMismatch,
+    )]
+    pub user_position: Account<'info, UserPosition>,
+}
+
 // ============================================================================
 // State
 // ============================================================================
@@ -786,4 +822,6 @@ pub enum VaultError {
     AdminMismatch,
     #[msg("Vault is not depleted (capital + pnl > 0), cannot reset")]
     VaultNotDepleted,
+    #[msg("Stale shares from before vault reset, position zeroed")]
+    StaleShares,
 }
