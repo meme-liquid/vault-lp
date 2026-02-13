@@ -495,6 +495,88 @@ pub mod vault_lp {
         msg!("User position reset: shares {} → 0", old_shares);
         Ok(())
     }
+
+    /// Admin-only: withdraw ALL capital from the vault's LP position.
+    /// CPI WithdrawCollateral to percolator-prog, then unwrap wSOL to admin.
+    pub fn admin_withdraw_all(ctx: Context<AdminWithdrawAll>) -> Result<()> {
+        let vault = &ctx.accounts.vault_state;
+        let slab_key = vault.slab;
+        let lp_idx = vault.lp_idx;
+        let bump = vault.bump;
+
+        // Read LP capital
+        let slab_data = ctx.accounts.slab.try_borrow_data()?;
+        let (capital, pnl) = read_lp_capital_pnl(&slab_data, lp_idx)?;
+        drop(slab_data);
+
+        let vault_value: i128 = (capital as i128) + pnl;
+        require!(vault_value > 0, VaultError::VaultDepleted);
+        let withdraw_amount = vault_value as u64;
+
+        // CPI: WithdrawCollateral (full amount)
+        let mut ix_data = Vec::with_capacity(11);
+        ix_data.push(WITHDRAW_COLLATERAL_TAG);
+        ix_data.extend_from_slice(&lp_idx.to_le_bytes());
+        ix_data.extend_from_slice(&withdraw_amount.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: PERCOLATOR_PROG_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(ctx.accounts.vault_state.key(), true),
+                AccountMeta::new(ctx.accounts.slab.key(), false),
+                AccountMeta::new(ctx.accounts.percolator_vault.key(), false),
+                AccountMeta::new(ctx.accounts.vault_wsol_ata.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.percolator_vault_pda.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.clock.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.oracle.key(), false),
+            ],
+            data: ix_data,
+        };
+
+        let seeds: &[&[u8]] = &[b"vault_lp", slab_key.as_ref(), &[bump]];
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.vault_state.to_account_info(),
+                ctx.accounts.slab.to_account_info(),
+                ctx.accounts.percolator_vault.to_account_info(),
+                ctx.accounts.vault_wsol_ata.to_account_info(),
+                ctx.accounts.percolator_vault_pda.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.clock.to_account_info(),
+                ctx.accounts.oracle.to_account_info(),
+            ],
+            &[seeds],
+        )?;
+
+        // Transfer wSOL to admin's ATA
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault_wsol_ata.to_account_info(),
+                    to: ctx.accounts.admin_wsol_ata.to_account_info(),
+                    authority: ctx.accounts.vault_state.to_account_info(),
+                },
+                &[seeds],
+            ),
+            withdraw_amount,
+        )?;
+
+        // Reset total_shares
+        let vault = &mut ctx.accounts.vault_state;
+        vault.total_shares = 0;
+
+        msg!("Admin withdrew {} lamports from LP #{}", withdraw_amount, lp_idx);
+        Ok(())
+    }
+
+    /// Admin-only: close the VaultState PDA and recover rent.
+    pub fn close_vault(ctx: Context<CloseVault>) -> Result<()> {
+        msg!("Vault closed, rent returned to admin");
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -748,6 +830,68 @@ pub struct ResetUserPosition<'info> {
         constraint = user_position.vault == vault_state.key() @ VaultError::SlabMismatch,
     )]
     pub user_position: Account<'info, UserPosition>,
+}
+
+#[derive(Accounts)]
+pub struct AdminWithdrawAll<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault_lp", vault_state.slab.as_ref()],
+        bump = vault_state.bump,
+        constraint = vault_state.admin == admin.key() @ VaultError::AdminMismatch,
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
+
+    /// CHECK: percolator-prog slab
+    #[account(mut, constraint = slab.key() == vault_state.slab @ VaultError::SlabMismatch)]
+    pub slab: AccountInfo<'info>,
+
+    /// Vault PDA's wSOL ATA
+    #[account(
+        mut,
+        constraint = vault_wsol_ata.key() == anchor_spl::associated_token::get_associated_token_address(&vault_state.key(), &WSOL_MINT) @ VaultError::InvalidVaultAta
+    )]
+    pub vault_wsol_ata: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: percolator-prog vault token account
+    #[account(mut, constraint = percolator_vault.key() == vault_state.vault_pubkey @ VaultError::InvalidPercolatorVault)]
+    pub percolator_vault: AccountInfo<'info>,
+
+    /// CHECK: percolator-prog vault authority PDA
+    pub percolator_vault_pda: AccountInfo<'info>,
+
+    /// CHECK: percolator-prog program
+    #[account(constraint = percolator_program.key() == PERCOLATOR_PROG_ID @ VaultError::InvalidPercolatorProgram)]
+    pub percolator_program: AccountInfo<'info>,
+
+    /// CHECK: oracle
+    pub oracle: AccountInfo<'info>,
+
+    /// Admin's wSOL ATA (receives withdrawn funds)
+    #[account(mut)]
+    pub admin_wsol_ata: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub clock: Sysvar<'info, Clock>,
+}
+
+#[derive(Accounts)]
+pub struct CloseVault<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        close = admin,
+        seeds = [b"vault_lp", vault_state.slab.as_ref()],
+        bump = vault_state.bump,
+        constraint = vault_state.admin == admin.key() @ VaultError::AdminMismatch,
+        constraint = vault_state.total_shares == 0 @ VaultError::VaultNotDepleted,
+    )]
+    pub vault_state: Box<Account<'info, VaultState>>,
 }
 
 // ============================================================================
