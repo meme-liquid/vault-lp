@@ -618,7 +618,7 @@ pub struct InitializeVault<'info> {
     pub admin: Signer<'info>,
 
     #[account(
-        init,
+        init_if_needed,
         payer = admin,
         space = 8 + VaultState::INIT_SPACE,
         seeds = [b"vault_lp", slab.key().as_ref()],
@@ -628,7 +628,7 @@ pub struct InitializeVault<'info> {
 
     /// Vault PDA's wSOL ATA — transit account for wrapping/unwrapping SOL
     #[account(
-        init,
+        init_if_needed,
         payer = admin,
         associated_token::mint = collateral_mint,
         associated_token::authority = vault_state,
