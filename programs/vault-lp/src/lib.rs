@@ -303,9 +303,11 @@ pub mod vault_lp {
             position.owner = ctx.accounts.depositor.key();
             position.bump = ctx.bumps.user_position;
         }
-        // After vault reset: if user has stale shares from before reset, zero them
-        if total_shares == 0 && position.shares > 0 {
+        // After vault reset: if user has stale shares from a previous epoch, zero them
+        let current_epoch = ctx.accounts.vault_state.reset_epoch;
+        if position.last_epoch < current_epoch {
             position.shares = 0;
+            position.last_epoch = current_epoch;
         }
         position.shares = position.shares
             .checked_add(new_shares)
@@ -329,11 +331,12 @@ pub mod vault_lp {
     pub fn withdraw(ctx: Context<Withdraw>, shares_to_burn: u128) -> Result<()> {
         require!(shares_to_burn > 0, VaultError::ZeroAmount);
 
-        // Invalidate stale shares from before vault reset
+        // Invalidate stale shares from before vault reset (epoch-based)
         let position = &mut ctx.accounts.user_position;
-        let total = ctx.accounts.vault_state.total_shares;
-        if total > 0 && position.shares > total {
+        let current_epoch = ctx.accounts.vault_state.reset_epoch;
+        if position.last_epoch < current_epoch {
             position.shares = 0;
+            position.last_epoch = current_epoch;
             return Err(VaultError::StaleShares.into());
         }
         require!(position.shares >= shares_to_burn, VaultError::InsufficientShares);
@@ -481,8 +484,9 @@ pub mod vault_lp {
         let vault = &mut ctx.accounts.vault_state;
         let old_shares = vault.total_shares;
         vault.total_shares = 0;
+        vault.reset_epoch = vault.reset_epoch.saturating_add(1);
 
-        msg!("Vault reset: total_shares {} → 0", old_shares);
+        msg!("Vault reset: total_shares {} → 0, epoch → {}", old_shares, vault.reset_epoch);
         Ok(())
     }
 
@@ -913,6 +917,8 @@ pub struct VaultState {
     pub percolator_program: Pubkey,// 32
     pub collateral_mint: Pubkey,   // 32
     pub vault_pubkey: Pubkey,      // 32
+    /// Incremented on each reset_vault. Positions with older epoch are auto-zeroed on next deposit.
+    pub reset_epoch: u64,          // 8
 }
 
 #[account]
@@ -922,6 +928,8 @@ pub struct UserPosition {
     pub owner: Pubkey,      // 32
     pub shares: u128,       // 16
     pub bump: u8,           // 1
+    /// Tracks which reset_epoch this position was last updated in.
+    pub last_epoch: u64,    // 8
 }
 
 // ============================================================================
